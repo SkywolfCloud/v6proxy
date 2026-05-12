@@ -1,0 +1,35 @@
+[Unit]
+Description=v6proxy - Random IPv6 Exit Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/v6proxy --config /etc/v6proxy/config.toml
+User=v6proxy
+Group=v6proxy
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/v6proxy
+ReadOnlyPaths=/etc/v6proxy
+PrivateTmp=true
+Restart=on-failure
+RestartSec=2s
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=v6proxy
+
+# Security hardening
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

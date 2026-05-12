@@ -1,0 +1,42 @@
+[admin]
+bind = "127.0.0.1:8787"
+# Generate with: echo -n "your-secret-token" | argon2 $(openssl rand -base64 16) -id -e
+token_hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$placeholder"
+allowlist = [
+  "127.0.0.1",
+  # "10.0.1.0/24",
+]
+
+[data]
+tcp_binds = ["0.0.0.0:80", "0.0.0.0:443", "[::]:80", "[::]:443"]
+udp_binds = ["0.0.0.0:443", "[::]:443"]
+
+[paths]
+state = "/var/lib/v6proxy/policies.json"
+
+[policy]
+# Default policy for traffic without a matching binding, and for new bindings
+# when the API request omits "policy".
+# Options: "src_ip", "src_dst", "five_tuple".
+default = "src_ip"
+# Default seed for traffic without a matching binding, and for new bindings
+# when the API request omits "seed".
+default_seed = 0
+
+[machine]
+v6_pools = ["2001:db8:a::/64", "2001:db8:b::/48"]
+# TODO: Add SNI routing rules here once the dataplane supports them.
+
+[egress]
+# Destination filtering for proxied traffic. Loopback, link-local, ULA,
+# multicast, IPv4-mapped, NAT64 and documentation ranges are ALWAYS denied
+# unless explicitly allow-listed below, so the proxy cannot be steered at the
+# host's own internal IPv6 services via SNI/Host.
+#
+# deny: extra CIDRs/IPs to block (in addition to the built-in ranges above).
+#       Add this machine's own public IPv6 address(es) here if it runs services
+#       on a global address that customers should not be able to reach.
+# allow: if non-empty, acts as a whitelist — only listed CIDRs/IPs are
+#        reachable, and an allow entry also overrides the built-in/deny rules.
+deny = []
+allow = []
