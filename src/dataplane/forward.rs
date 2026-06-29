@@ -4,8 +4,6 @@ use anyhow::{Context, Result};
 use tokio::io;
 use tokio::net::TcpStream;
 
-use crate::config::EgressFilter;
-
 /// Bind to a specific IPv6 source address (with IP_FREEBIND) and connect to destination.
 /// `dst_addr` must be an IPv6 address; IPv4-only destinations are rejected before this call.
 pub async fn bind_and_connect(src_v6: Ipv6Addr, dst_addr: SocketAddr) -> Result<TcpStream> {
@@ -70,7 +68,7 @@ pub async fn copy_bidirectional(
 /// Resolve a hostname to a SocketAddr, IPv6 only, subject to the egress filter.
 /// Returns an error if the host has no AAAA record, or if every resolved IPv6
 /// address is blocked by the egress policy.
-pub async fn resolve_dst(host: &str, port: u16, filter: &EgressFilter) -> Result<SocketAddr> {
+pub async fn resolve_dst(host: &str, port: u16) -> Result<SocketAddr> {
     use tokio::net::lookup_host;
 
     let addrs: Vec<SocketAddr> = lookup_host(format!("{}:{}", host, port))
@@ -87,10 +85,12 @@ pub async fn resolve_dst(host: &str, port: u16, filter: &EgressFilter) -> Result
     }
 
     // Only accept IPv6 destinations the egress policy permits.
+    let filter = crate::acl::EGRESS_FILTER.load();
     if let Some(v6) = v6_addrs.iter().find(|a| filter.is_allowed(a.ip())) {
         return Ok(**v6);
     }
 
+    crate::acl::note_egress_blocked();
     anyhow::bail!(
         "all IPv6 destinations for {} are blocked by the egress policy",
         host

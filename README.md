@@ -53,6 +53,11 @@ udp_binds = ["0.0.0.0:443", "[::]:443"]
 [paths]
 state = "/var/lib/v6proxy/policies.json"
 
+[log]
+# Level/filter (RUST_LOG syntax) and output format ("text" | "json").
+level = "info"
+format = "text"
+
 [policy]
 # Default policy for traffic without a matching binding, and for new bindings
 # when the API request omits "policy".
@@ -65,6 +70,18 @@ default_seed = 0
 [machine]
 v6_pools = ["2001:db8:a::/64", "2001:db8:b::/48"]
 # TODO: Add SNI routing rules here once the dataplane supports them.
+
+[egress]
+# Destination IP filter (model B: most-specific CIDR wins, ties -> deny).
+# Built-in special-use ranges are always denied. Runtime-manageable too.
+deny = []
+allow = []
+
+[domain]
+# SNI/Host ACL, mosdns rules: full: / domain: / keyword: (bare = domain:).
+# Model B: most-specific wins. A non-empty allow => whitelist mode.
+deny = []
+allow = []
 ```
 
 Notes:
@@ -77,6 +94,11 @@ Notes:
 - `data.udp_binds` controls QUIC listeners.
 - `paths.state` points to the runtime policies file. The parent directory is
   created automatically.
+- `log.level` sets the log level/filter (same syntax as `RUST_LOG`, e.g.
+  `info`, `warn`, or `v6proxy=debug,info`). The `RUST_LOG` env var, if set,
+  overrides it.
+- `log.format` is `text` (default) or `json`. The `--log-format` CLI flag
+  overrides it.
 - `policy.default` controls the hash policy for traffic without a matching
   binding, and for new bindings when the API request omits `policy`. Valid
   values are `src_ip`, `src_dst`, and `five_tuple`.
@@ -104,10 +126,73 @@ Authorization: Bearer <token>
 Use `src_ip` when stability matters most. Use `five_tuple` when you want more
 rotation across concurrent flows.
 
+## Destination & Domain ACL
+
+Two filters decide whether traffic is forwarded. Both resolve allow/deny with
+**model B (most-specific wins)**: among the rules matching a target, the most
+specific one decides; a tie goes to deny; if nothing matches, a non-empty
+`allow` means whitelist mode (reject the rest), otherwise default-allow.
+
+- **`[egress]`** filters the resolved destination **IP**. Entries are CIDRs or
+  bare IPs; specificity is the prefix length. Built-in special-use ranges
+  (loopback, link-local, ULA, multicast, IPv4-mapped, NAT64, documentation) are
+  always denied. A broad `allow` can be punched through by a more specific
+  `deny`, and vice-versa.
+- **`[domain]`** filters the **SNI/Host** before DNS resolution (HTTP `Host`,
+  TLS SNI, QUIC SNI). Rules are mosdns-style:
+
+  | Rule | Matches |
+  | ---- | ------- |
+  | `full:example.com` | exactly `example.com` |
+  | `domain:example.com` | `example.com` and any subdomain (a bare entry = this) |
+  | `keyword:ads` | any host containing `ads` |
+
+  Specificity: `full` > deeper `domain` zone > shallower `domain` zone >
+  `keyword`. `regexp:` is intentionally unsupported.
+
+Both filters are two-layer: the `config.toml` base (read-only, reloaded each
+start) plus a runtime overlay persisted in `policies.json`. The admin API
+manages the overlay as add/del increments, so you can add rules or suppress a
+base rule at runtime without editing `config.toml`. Blocked connections are
+dropped and counted (`v6proxy_domain_blocked_total`, `v6proxy_egress_blocked_total`).
+
+> Whitelist footgun: adding any `allow` rule switches that filter into whitelist
+> mode, rejecting everything not explicitly allowed.
+
+Block a whole zone but allow one host inside it (model B picks the more specific
+`full:` for the exception):
+
+```toml
+[domain]
+deny  = ["domain:example.com"]
+allow = ["full:safe.example.com"]
+```
+
+Manage rules at runtime (add to the deny overlay, then inspect effective lists):
+
+```bash
+curl -X POST http://127.0.0.1:8787/v1/domains/deny \
+  -H 'Authorization: Bearer your-secret-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"rules":["domain:ads.example.com","keyword:tracker"]}'
+
+curl -X POST http://127.0.0.1:8787/v1/egress/deny \
+  -H 'Authorization: Bearer your-secret-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"rules":["2001:db8:bad::/48"]}'
+
+curl http://127.0.0.1:8787/v1/domains -H 'Authorization: Bearer your-secret-token'
+```
+
+`GET` returns each list's `base` (from config), `add`/`del` (the overlay), and
+the resulting `effective` set. `DELETE` with the same body removes rules (and
+suppresses a base rule if it names one).
+
 ## Admin API
 
 `/v1/healthz` has no auth. `/v1/metrics` requires the caller source IP to be in
-`admin.allowlist`. Binding endpoints require both allowlist and bearer token.
+`admin.allowlist`. Binding, domain, and egress endpoints require both allowlist
+and bearer token.
 
 ```text
 GET    /v1/healthz
@@ -118,7 +203,20 @@ PUT    /v1/bindings/:srcip
 PATCH  /v1/bindings/:srcip/hash_policy
 POST   /v1/bindings/:srcip/reseed
 DELETE /v1/bindings/:srcip
+GET    /v1/domains
+POST   /v1/domains/allow
+DELETE /v1/domains/allow
+POST   /v1/domains/deny
+DELETE /v1/domains/deny
+GET    /v1/egress
+POST   /v1/egress/allow
+DELETE /v1/egress/allow
+POST   /v1/egress/deny
+DELETE /v1/egress/deny
 ```
+
+Domain/egress mutation endpoints take a JSON body `{"rules": ["...", ...]}` and
+return the updated view (`base` / `add` / `del` / `effective`).
 
 `GET /v1/bindings/:srcip` always returns `200` for a valid source IP. When a
 dedicated binding exists, `exists` is `true`. When no dedicated binding exists,
@@ -183,14 +281,35 @@ CAP_NET_BIND_SERVICE CAP_NET_RAW
 ## Run Manually
 
 ```bash
-RUST_LOG=info /usr/local/bin/v6proxy --config /etc/v6proxy/config.toml
+/usr/local/bin/v6proxy --config /etc/v6proxy/config.toml
 ```
 
-Logs default to text output. Use JSON for structured log collection:
+## Logging
+
+Logging is driven by the `[log]` section of `config.toml` (`level` and
+`format`), and can be overridden at runtime:
+
+- **Level** — `RUST_LOG` env var overrides `log.level`. Both use the same
+  filter syntax (`info`, `warn`, `debug`, `v6proxy=debug,info`).
+- **Format** — the `--log-format text|json` flag overrides `log.format`.
 
 ```bash
-RUST_LOG=info /usr/local/bin/v6proxy --config /etc/v6proxy/config.toml --log-format json
+# Use the config's [log] settings:
+/usr/local/bin/v6proxy --config /etc/v6proxy/config.toml
+# Override level (env) and format (flag) at runtime:
+RUST_LOG=debug /usr/local/bin/v6proxy --config /etc/v6proxy/config.toml --log-format json
 ```
+
+At `info`, every established connection logs one line with the peer, the
+resolved destination, the chosen outgoing IPv6 address, and the SNI/Host:
+
+```text
+INFO v6proxy::dataplane::tcp: forwarding connection peer=203.0.113.10:42166 dst=[2606:...]:443 src_v6=2001:db8:a::1 sni=example.com
+```
+
+Set `RUST_LOG=debug` for per-packet detail (accepted/closed connections, QUIC
+parsing). For systemd, set the level with `Environment=RUST_LOG=...` in the
+unit (or `systemctl edit v6proxy`).
 
 Create a starter config:
 

@@ -8,19 +8,15 @@ use tracing::{debug, error, info, warn, Instrument};
 use super::forward;
 use super::hash;
 use super::sni;
-use crate::config::{EgressFilter, V6Pool};
+use crate::config::V6Pool;
 use crate::state::{self, POLICIES};
 
 #[allow(dead_code)]
-pub async fn run_tcp_listener(
-    bind_addr: String,
-    pools: Arc<Vec<V6Pool>>,
-    egress: Arc<EgressFilter>,
-) -> Result<()> {
+pub async fn run_tcp_listener(bind_addr: String, pools: Arc<Vec<V6Pool>>) -> Result<()> {
     let listener = TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("failed to bind TCP on {}", bind_addr))?;
-    run_tcp_listener_on(listener, &bind_addr, pools, egress).await
+    run_tcp_listener_on(listener, &bind_addr, pools).await
 }
 
 /// Run the TCP listener accept loop on a pre-bound TcpListener.
@@ -28,7 +24,6 @@ pub async fn run_tcp_listener_on(
     listener: TcpListener,
     bind_addr: &str,
     pools: Arc<Vec<V6Pool>>,
-    egress: Arc<EgressFilter>,
 ) -> Result<()> {
     let local_addr = listener.local_addr()?;
     let local_port = local_addr.port();
@@ -38,12 +33,11 @@ pub async fn run_tcp_listener_on(
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let pools = Arc::clone(&pools);
-                let egress = Arc::clone(&egress);
                 let span = tracing::info_span!("tcp_conn", peer = %peer, port = local_port);
                 tokio::spawn(
                     async move {
-                        info!(peer = %peer, port = local_port, "TCP connection accepted");
-                        if let Err(e) = handle_tcp(stream, peer, local_port, &pools, &egress).await {
+                        debug!(peer = %peer, port = local_port, "TCP connection accepted");
+                        if let Err(e) = handle_tcp(stream, peer, local_port, &pools).await {
                             debug!(error = %e, "connection error");
                         }
                     }
@@ -62,7 +56,6 @@ async fn handle_tcp(
     peer: SocketAddr,
     local_port: u16,
     pools: &[V6Pool],
-    egress: &EgressFilter,
 ) -> Result<()> {
     // 1. Look up binding by srcip
     let policies = POLICIES.load();
@@ -90,9 +83,16 @@ async fn handle_tcp(
         }
     };
 
+    // 2b. Domain ACL: drop before any DNS resolution if the host is blocked.
+    if !crate::acl::DOMAIN_FILTER.load().is_allowed(&dst_host) {
+        crate::acl::note_domain_blocked();
+        info!(peer = %peer, sni = %dst_host, "blocked by domain ACL, dropping");
+        return Ok(());
+    }
+
     // 3. Resolve destination (subject to the egress filter)
     let dst_port = local_port;
-    let dst_addr = forward::resolve_dst(&dst_host, dst_port, egress).await?;
+    let dst_addr = forward::resolve_dst(&dst_host, dst_port).await?;
 
     // 4. Compute outgoing v6 address
     let src_v6 = match hash::pick_outgoing(
@@ -110,7 +110,7 @@ async fn handle_tcp(
         }
     };
 
-    debug!(
+    info!(
         peer = %peer,
         dst = %dst_addr,
         src_v6 = %src_v6,

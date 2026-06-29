@@ -1,3 +1,4 @@
+mod acl;
 mod api;
 mod config;
 mod dataplane;
@@ -8,9 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
+
+use config::{LogConfig, LogFormat};
 
 const DEFAULT_CONFIG: &str = include_str!("../deploy/examples/config.toml");
 
@@ -25,18 +28,12 @@ struct Cli {
     #[arg(long)]
     check_config: bool,
 
-    /// Log output format.
-    #[arg(long, global = true, value_enum, default_value = "text")]
-    log_format: LogFormat,
+    /// Log output format (overrides `[log].format` in the config).
+    #[arg(long, global = true, value_enum)]
+    log_format: Option<LogFormat>,
 
     #[command(subcommand)]
     command: Option<Command>,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum LogFormat {
-    Text,
-    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -53,26 +50,31 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    init_logging(cli.log_format);
-
+    // The `init` subcommand creates a config, so there is none to read logging
+    // settings from yet — use defaults (still honoring --log-format / RUST_LOG).
     if let Some(Command::Init { force }) = cli.command {
+        init_logging(cli.log_format, &LogConfig::default());
         init_config(&cli.config, force)?;
         info!(config = %cli.config.display(), "config initialized");
         return Ok(());
     }
 
+    // Load the config first so logging can honor its [log] section, then bring
+    // logging up before the validation phase so its logs are captured.
+    let config = config::Config::load(&cli.config).context("failed to load config")?;
+    init_logging(cli.log_format, &config.log);
+
     if cli.check_config {
-        check_config(&cli.config)?;
+        validate_config(config)?;
         info!(config = %cli.config.display(), "config ok");
         return Ok(());
     }
 
     info!(config = %cli.config.display(), "starting v6proxy");
 
-    let loaded = load_and_validate_config(&cli.config)?;
+    let loaded = validate_config(config)?;
     let config = loaded.config;
     let pools = Arc::new(loaded.pools);
-    let egress = Arc::new(loaded.egress);
     let tokens = loaded.tokens;
     state::init_default_binding(config.policy.default, config.policy.default_seed);
 
@@ -92,6 +94,11 @@ async fn main() -> Result<()> {
 
     state::init_state_path(state_path);
     state::POLICIES.store(Arc::new(policies));
+
+    // Build the domain ACL from the [domain] base + persisted overlay, ready
+    // for the data plane to read.
+    acl::init_domain_filter(config.domain.allow.clone(), config.domain.deny.clone());
+    acl::init_egress_filter(config.egress.allow.clone(), config.egress.deny.clone());
 
     // Phase 5: Bind all listeners BEFORE spawning serve loops.
     // This ensures bind errors fail startup immediately.
@@ -137,10 +144,8 @@ async fn main() -> Result<()> {
 
     for (addr, listener) in tcp_listeners {
         let pools = Arc::clone(&pools);
-        let egress = Arc::clone(&egress);
         tokio::spawn(async move {
-            if let Err(e) = dataplane::tcp::run_tcp_listener_on(listener, &addr, pools, egress).await
-            {
+            if let Err(e) = dataplane::tcp::run_tcp_listener_on(listener, &addr, pools).await {
                 error!(addr = %addr, error = %e, "TCP listener failed");
             }
         });
@@ -148,11 +153,8 @@ async fn main() -> Result<()> {
 
     for (addr, socket) in udp_sockets {
         let pools = Arc::clone(&pools);
-        let egress = Arc::clone(&egress);
         tokio::spawn(async move {
-            if let Err(e) =
-                dataplane::quic::run_quic_listener_on(socket, &addr, pools, egress).await
-            {
+            if let Err(e) = dataplane::quic::run_quic_listener_on(socket, &addr, pools).await {
                 error!(addr = %addr, error = %e, "QUIC listener failed");
             }
         });
@@ -173,9 +175,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_logging(log_format: LogFormat) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    match log_format {
+fn init_logging(cli_format: Option<LogFormat>, log: &LogConfig) {
+    // RUST_LOG (if set) wins over the configured level; otherwise use [log].level.
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log.level.as_str()));
+    // --log-format (if passed) wins over the configured format.
+    let format = cli_format.unwrap_or(log.format);
+    match format {
         LogFormat::Text => fmt().with_env_filter(filter).init(),
         LogFormat::Json => fmt().with_env_filter(filter).json().init(),
     }
@@ -184,13 +190,8 @@ fn init_logging(log_format: LogFormat) {
 struct LoadedConfig {
     config: config::Config,
     pools: Vec<config::V6Pool>,
-    egress: config::EgressFilter,
     tokens: config::ParsedTokensConfig,
     admin_bind: SocketAddr,
-}
-
-fn check_config(config_path: &Path) -> Result<()> {
-    load_and_validate_config(config_path).map(|_| ())
 }
 
 fn init_config(config_path: &Path, force: bool) -> Result<()> {
@@ -212,20 +213,24 @@ fn init_config(config_path: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn load_and_validate_config(config_path: &Path) -> Result<LoadedConfig> {
-    // Phase 1: Load config
-    let config = config::Config::load(config_path).context("failed to load config")?;
-
-    // Phase 2: Parse IPv6 pools
+fn validate_config(config: config::Config) -> Result<LoadedConfig> {
+    // Parse IPv6 pools
     let pools = config.parse_pools().context("failed to parse v6 pools")?;
     anyhow::ensure!(!pools.is_empty(), "machine.v6_pools must not be empty");
     info!(pools = pools.len(), "loaded v6 pools");
 
-    // Parse egress destination filter (allow/deny + built-in special-use ranges)
-    let egress = config
+    // Validate the [egress] base now so bad CIDRs fail --check-config / startup;
+    // the live filter is built later from base + persisted overlay.
+    config
         .egress
         .build_filter()
         .context("failed to parse egress filter")?;
+
+    // Validate the [domain] base rules so bad rules fail --check-config / startup.
+    config
+        .domain
+        .validate()
+        .context("failed to parse [domain] rules")?;
 
     // Phase 3: Parse admin auth config
     let tokens = config
@@ -258,7 +263,6 @@ fn load_and_validate_config(config_path: &Path) -> Result<LoadedConfig> {
     Ok(LoadedConfig {
         config,
         pools,
-        egress,
         tokens,
         admin_bind,
     })

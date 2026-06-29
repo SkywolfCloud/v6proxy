@@ -8,6 +8,7 @@ use crate::config::ParsedTokensConfig;
 pub fn router(tokens: ParsedTokensConfig) -> Router {
     // Tier 1: IP allowlist + token — full CRUD
     let authenticated = handlers::bindings_router()
+        .merge(handlers::acl_router())
         .layer(axum::middleware::from_fn_with_state(
             tokens.clone(),
             auth::token_middleware,

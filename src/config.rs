@@ -16,19 +16,80 @@ pub struct Config {
     pub policy: PolicyConfig,
     #[serde(default)]
     pub egress: EgressConfig,
+    #[serde(default)]
+    pub domain: DomainConfig,
+    #[serde(default)]
+    pub log: LogConfig,
 }
 
-/// Egress destination filtering. An address is permitted when it is explicitly
-/// allow-listed (an `allow` entry overrides everything), otherwise it is rejected
-/// if it falls in `deny` or in the built-in special-use ranges; when `allow` is
-/// non-empty the filter operates in whitelist mode and anything not allow-listed
-/// is rejected.
+/// Log output format. Also usable as a CLI value (`--log-format`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+/// Logging configuration. Both fields can be overridden at runtime: the
+/// `RUST_LOG` env var overrides `level`, and the `--log-format` CLI flag
+/// overrides `format`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct LogConfig {
+    /// Level / filter directive, same syntax as `RUST_LOG`
+    /// (e.g. "info", "warn", "v6proxy=debug,info").
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    #[serde(default)]
+    pub format: LogFormat,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            format: LogFormat::default(),
+        }
+    }
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+/// Egress destination filtering (base layer for `[egress]`). Allow/deny entries
+/// are CIDRs resolved with model B: the most specific (longest-prefix) match
+/// wins, ties go to deny, and the built-in special-use ranges are always part of
+/// deny. When nothing matches, a non-empty `allow` puts the filter in whitelist
+/// mode (reject), otherwise it default-allows.
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct EgressConfig {
     #[serde(default)]
     pub allow: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+}
+
+/// Domain (SNI/Host) allow/deny base list from `[domain]`. Entries are
+/// mosdns-style rules (`full:` / `domain:` / `keyword:`, bare = `domain:`) and
+/// are resolved with model B (most-specific-wins), same as the egress filter.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct DomainConfig {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl DomainConfig {
+    /// Validate that every base rule parses. Called at startup / --check-config.
+    pub fn validate(&self) -> Result<()> {
+        for rule in self.allow.iter().chain(self.deny.iter()) {
+            crate::acl::parse_rule(rule)
+                .with_context(|| format!("invalid [domain] rule: {}", rule))?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -132,24 +193,31 @@ pub struct ParsedTokensConfig {
     pub admin_allowlist: Vec<IpNet>,
 }
 
+/// Parse one allow/deny entry — an IP (host route) or a CIDR — into a network.
+pub fn parse_net(entry: &str) -> Result<IpNet> {
+    if entry.contains('/') {
+        entry
+            .parse::<IpNet>()
+            .with_context(|| format!("invalid CIDR: {}", entry))
+    } else {
+        let ip: IpAddr = entry
+            .parse()
+            .with_context(|| format!("invalid IP: {}", entry))?;
+        Ok(IpNet::from(ip))
+    }
+}
+
 /// Parse a list of "ip" or "cidr" strings into networks (a bare IP becomes a
 /// host route). Shared by the admin allowlist and the egress filter.
 fn parse_net_list(entries: &[String]) -> Result<Vec<IpNet>> {
-    entries
-        .iter()
-        .map(|entry| {
-            if entry.contains('/') {
-                entry
-                    .parse::<IpNet>()
-                    .with_context(|| format!("invalid CIDR: {}", entry))
-            } else {
-                let ip: IpAddr = entry
-                    .parse()
-                    .with_context(|| format!("invalid IP: {}", entry))?;
-                Ok(IpNet::from(ip))
-            }
-        })
-        .collect()
+    entries.iter().map(|e| parse_net(e)).collect()
+}
+
+/// Parse an egress entry and re-render it in canonical (host-bits-zeroed) CIDR
+/// form, so dynamic add/del entries compare equal to the config base regardless
+/// of formatting.
+pub fn canonicalize_net(entry: &str) -> Result<String> {
+    Ok(parse_net(entry)?.trunc().to_string())
 }
 
 impl AdminConfig {
@@ -183,34 +251,49 @@ fn builtin_blocked_nets() -> Vec<IpNet> {
 }
 
 /// Resolved egress destination filter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EgressFilter {
     allow: Vec<IpNet>,
     deny: Vec<IpNet>,
 }
 
 impl EgressFilter {
-    /// Returns true if the proxy may connect outbound to `ip`.
+    /// Returns true if the proxy may connect outbound to `ip`. Resolved with
+    /// model B: the most specific (longest-prefix) matching CIDR wins, a tie
+    /// goes to deny, and if nothing matches a non-empty allow list means
+    /// whitelist mode (reject) while an empty one default-allows.
     pub fn is_allowed(&self, ip: IpAddr) -> bool {
-        // An explicit allow entry overrides every deny rule.
-        if self.allow.iter().any(|n| n.contains(&ip)) {
-            return true;
-        }
-        if self.deny.iter().any(|n| n.contains(&ip)) {
-            return false;
-        }
-        // Whitelist mode: with a non-empty allow list, anything not matched above
-        // is rejected. With an empty allow list, default-allow.
-        self.allow.is_empty()
+        let best_allow = self
+            .allow
+            .iter()
+            .filter(|n| n.contains(&ip))
+            .map(|n| n.prefix_len())
+            .max();
+        let best_deny = self
+            .deny
+            .iter()
+            .filter(|n| n.contains(&ip))
+            .map(|n| n.prefix_len())
+            .max();
+        crate::acl::decide(best_allow, best_deny, self.allow.is_empty())
+    }
+}
+
+impl EgressFilter {
+    /// Build from raw allow/deny entry strings (the config base merged with the
+    /// dynamic overlay). The built-in special-use ranges are always added to
+    /// deny so a customer cannot steer the proxy at internal services.
+    pub fn build(allow: &[String], deny: &[String]) -> Result<Self> {
+        let allow = parse_net_list(allow).context("invalid egress allow entry")?;
+        let mut deny = parse_net_list(deny).context("invalid egress deny entry")?;
+        deny.extend(builtin_blocked_nets());
+        Ok(EgressFilter { allow, deny })
     }
 }
 
 impl EgressConfig {
     pub fn build_filter(&self) -> Result<EgressFilter> {
-        let allow = parse_net_list(&self.allow).context("invalid egress allow entry")?;
-        let mut deny = parse_net_list(&self.deny).context("invalid egress deny entry")?;
-        deny.extend(builtin_blocked_nets());
-        Ok(EgressFilter { allow, deny })
+        EgressFilter::build(&self.allow, &self.deny)
     }
 }
 
@@ -346,5 +429,55 @@ default_seed = "0x2a"
         assert!(filter.is_allowed("fd12:3456::1".parse().unwrap()));
         // Whitelist mode: a public address not in `allow` is rejected.
         assert!(!filter.is_allowed("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn domain_config_defaults_empty_when_omitted() {
+        let config: Config = toml::from_str(&minimal_config("")).unwrap();
+        assert!(config.domain.allow.is_empty());
+        assert!(config.domain.deny.is_empty());
+    }
+
+    #[test]
+    fn domain_config_parses_allow_and_deny() {
+        let config: Config = toml::from_str(&minimal_config(
+            r#"
+[domain]
+allow = ["full:safe.example.com"]
+deny = ["domain:example.com", "keyword:ads"]
+"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            config.domain.allow,
+            vec!["full:safe.example.com".to_string()]
+        );
+        assert_eq!(config.domain.deny.len(), 2);
+        config.domain.validate().unwrap();
+    }
+
+    #[test]
+    fn domain_config_validate_rejects_bad_rule() {
+        let config: Config = toml::from_str(&minimal_config(
+            r#"
+[domain]
+deny = ["regexp:nope"]
+"#,
+        ))
+        .unwrap();
+        assert!(config.domain.validate().is_err());
+    }
+
+    #[test]
+    fn egress_allows_broad_range_but_blocks_specific_subrange() {
+        // Model B: the most specific (longest-prefix) match wins, so a narrow
+        // deny carves a hole inside a broad allow.
+        let cfg = EgressConfig {
+            allow: vec!["2606:4700::/32".to_string()],
+            deny: vec!["2606:4700:dead::/48".to_string()],
+        };
+        let filter = cfg.build_filter().unwrap();
+        assert!(!filter.is_allowed("2606:4700:dead::1".parse().unwrap()));
+        assert!(filter.is_allowed("2606:4700:beef::1".parse().unwrap()));
     }
 }

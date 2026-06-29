@@ -8,7 +8,7 @@ use tokio::net::UdpSocket;
 use tracing::{debug, error, info, warn};
 
 use super::hash;
-use crate::config::{EgressFilter, V6Pool};
+use crate::config::V6Pool;
 use crate::state::{self, POLICIES};
 
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
@@ -27,15 +27,11 @@ struct QuicSession {
 type SessionKey = (IpAddr, u16); // (client_ip, client_port)
 
 #[allow(dead_code)]
-pub async fn run_quic_listener(
-    bind_addr: String,
-    pools: Arc<Vec<V6Pool>>,
-    egress: Arc<EgressFilter>,
-) -> Result<()> {
+pub async fn run_quic_listener(bind_addr: String, pools: Arc<Vec<V6Pool>>) -> Result<()> {
     let socket = UdpSocket::bind(&bind_addr)
         .await
         .with_context(|| format!("failed to bind UDP on {}", bind_addr))?;
-    run_quic_listener_on(socket, &bind_addr, pools, egress).await
+    run_quic_listener_on(socket, &bind_addr, pools).await
 }
 
 /// Run the QUIC/UDP listener on a pre-bound UdpSocket.
@@ -43,7 +39,6 @@ pub async fn run_quic_listener_on(
     socket: UdpSocket,
     bind_addr: &str,
     pools: Arc<Vec<V6Pool>>,
-    egress: Arc<EgressFilter>,
 ) -> Result<()> {
     let socket = Arc::new(socket);
 
@@ -71,11 +66,10 @@ pub async fn run_quic_listener_on(
                 let sessions = Arc::clone(&sessions);
                 let socket = Arc::clone(&socket);
                 let pools = Arc::clone(&pools);
-                let egress = Arc::clone(&egress);
 
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_quic_packet(&socket, peer, &data, &sessions, &pools, &egress).await
+                        handle_quic_packet(&socket, peer, &data, &sessions, &pools).await
                     {
                         debug!(error = %e, peer = %peer, "QUIC packet handling error");
                     }
@@ -94,7 +88,6 @@ async fn handle_quic_packet(
     data: &[u8],
     sessions: &Arc<DashMap<SessionKey, QuicSession>>,
     pools: &[V6Pool],
-    egress: &EgressFilter,
 ) -> Result<()> {
     let key = (peer.ip(), peer.port());
 
@@ -107,7 +100,7 @@ async fn handle_quic_packet(
     }
 
     // New connection — need to parse QUIC Initial to get SNI
-    info!(peer = %peer, "QUIC session accepted");
+    debug!(peer = %peer, "QUIC session accepted");
 
     let policies = POLICIES.load();
     let binding = match policies.bindings.get(&peer.ip()) {
@@ -132,8 +125,15 @@ async fn handle_quic_packet(
         }
     };
 
+    // Domain ACL: drop blocked SNIs before resolving upstream.
+    if !crate::acl::DOMAIN_FILTER.load().is_allowed(&sni) {
+        crate::acl::note_domain_blocked();
+        info!(peer = %peer, sni = %sni, "blocked by domain ACL, dropping");
+        return Ok(());
+    }
+
     // Resolve destination (subject to the egress filter)
-    let dst_addr = crate::dataplane::forward::resolve_dst(&sni, 443, egress).await?;
+    let dst_addr = crate::dataplane::forward::resolve_dst(&sni, 443).await?;
 
     // Pick outgoing v6
     let src_v6 =
@@ -154,7 +154,7 @@ async fn handle_quic_packet(
     let upstream_socket = create_v6_udp_socket(src_v6).await?;
     let upstream_socket = Arc::new(upstream_socket);
 
-    debug!(
+    info!(
         peer = %peer,
         dst = %dst_addr,
         src_v6 = %src_v6,
@@ -164,14 +164,6 @@ async fn handle_quic_packet(
 
     // Forward the initial packet
     upstream_socket.send_to(data, dst_addr).await?;
-
-    debug!(
-        peer = %peer,
-        dst = %dst_addr,
-        src_v6 = %src_v6,
-        sni = %sni,
-        "new QUIC session"
-    );
 
     // Store session
     sessions.insert(

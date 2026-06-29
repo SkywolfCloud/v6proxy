@@ -14,6 +14,15 @@ udp_binds = ["0.0.0.0:443", "[::]:443"]
 [paths]
 state = "/var/lib/v6proxy/policies.json"
 
+[log]
+# Log level / filter. Same syntax as the RUST_LOG env var, e.g. "info", "warn",
+# "debug", or a per-target filter like "v6proxy=debug,info". At "info" each
+# forwarded connection logs one line with peer, dst, src_v6 (the outgoing IPv6)
+# and sni. The RUST_LOG env var, if set, overrides this.
+level = "info"
+# Output format: "text" or "json". The --log-format CLI flag overrides this.
+format = "text"
+
 [policy]
 # Default policy for traffic without a matching binding, and for new bindings
 # when the API request omits "policy".
@@ -28,15 +37,32 @@ v6_pools = ["2001:db8:a::/64", "2001:db8:b::/48"]
 # TODO: Add SNI routing rules here once the dataplane supports them.
 
 [egress]
-# Destination filtering for proxied traffic. Loopback, link-local, ULA,
-# multicast, IPv4-mapped, NAT64 and documentation ranges are ALWAYS denied
-# unless explicitly allow-listed below, so the proxy cannot be steered at the
-# host's own internal IPv6 services via SNI/Host.
+# Destination IP filtering for proxied traffic. Loopback, link-local, ULA,
+# multicast, IPv4-mapped, NAT64 and documentation ranges are ALWAYS denied so
+# the proxy cannot be steered at the host's own internal IPv6 services.
 #
-# deny: extra CIDRs/IPs to block (in addition to the built-in ranges above).
-#       Add this machine's own public IPv6 address(es) here if it runs services
-#       on a global address that customers should not be able to reach.
-# allow: if non-empty, acts as a whitelist — only listed CIDRs/IPs are
-#        reachable, and an allow entry also overrides the built-in/deny rules.
+# allow/deny are CIDRs or bare IPs, resolved "most specific wins" (longest
+# prefix; ties go to deny). A broad allow can be punched through by a more
+# specific deny, and vice-versa. If allow is non-empty the filter becomes a
+# whitelist (everything unlisted is rejected).
+#
+# This is the static base; entries can also be added/removed at runtime via the
+# admin API (POST/DELETE /v1/egress/{allow,deny}), persisted in policies.json.
 deny = []
 allow = []
+
+[domain]
+# Domain (SNI/Host) filtering, checked before DNS resolution on TCP and QUIC.
+# Rules use mosdns-style prefixes (regexp is NOT supported):
+#   full:example.com     exact match only
+#   domain:example.com   example.com and any subdomain (a bare entry = this)
+#   keyword:ads          any host containing the substring
+# Resolved "most specific wins" (full > deeper domain > shallower domain >
+# keyword; ties go to deny). If allow is non-empty the filter is a whitelist.
+#
+# Static base; also runtime-manageable via POST/DELETE /v1/domains/{allow,deny}.
+# Example — block a whole zone but allow one host inside it:
+#   deny  = ["domain:example.com"]
+#   allow = ["full:safe.example.com"]
+allow = []
+deny = []
