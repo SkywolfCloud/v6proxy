@@ -17,6 +17,9 @@ PrivateTmp=true
 Restart=on-failure
 RestartSec=2s
 
+# Allow many concurrent connections (each open socket consumes a file descriptor)
+LimitNOFILE=1048576
+
 # Logging
 StandardOutput=journal
 StandardError=journal
